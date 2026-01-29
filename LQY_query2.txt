@@ -1,0 +1,221 @@
+SET SQLBLANKLINES ON
+SET PAGESIZE 35
+SET LINESIZE 130
+SET SERVEROUTPUT ON
+
+ACCEPT p_year_from NUMBER  PROMPT 'Enter START YEAR (e.g., 2017): '
+ACCEPT p_year_to   NUMBER  PROMPT 'Enter END YEAR   (e.g., 2020): '
+ACCEPT p_topn      NUMBER  DEFAULT '11' PROMPT 'Top N genres per Quarter [11]: '
+ACCEPT p_suppliers CHAR    DEFAULT '%' PROMPT 'Supplier names (comma-separated, or % for All): '
+
+COLUMN run_date NEW_VALUE _run_date
+SELECT TO_CHAR(SYSDATE,'DD-MON-YYYY') AS run_date FROM dual;
+
+COLUMN sup_hdr NEW_VALUE _sup_hdr
+WITH supplier_list AS (
+  SELECT TRIM(REGEXP_SUBSTR(UPPER('&p_suppliers'), '[^,]+', 1, LEVEL)) AS supplier_name
+  FROM dual
+  CONNECT BY LEVEL <= CASE WHEN '&p_suppliers' = '%' THEN 1
+                           ELSE REGEXP_COUNT('&p_suppliers', ',') + 1 END
+),
+matched AS (
+  SELECT DISTINCT s.supplierName
+  FROM DimSuppliers s
+  WHERE '&p_suppliers' = '%'
+     OR UPPER(s.supplierName) IN (SELECT supplier_name FROM supplier_list)
+)
+SELECT CASE
+         WHEN '&p_suppliers' = '%' THEN 'Suppliers: All'
+         WHEN COUNT(*) = 0        THEN 'Suppliers: (none matched)'
+         ELSE 'Suppliers: ' || SUBSTR(
+                LISTAGG(supplierName, ', ') WITHIN GROUP (ORDER BY supplierName), 1, 120)
+       END AS sup_hdr
+FROM matched;
+
+-- ===== Title =====
+TTITLE CENTER 'Quarterly Purchase Spend And Orders by Genre' SKIP 1 -
+       CENTER 'Years: &p_year_from to &p_year_to   |   Top-N: &p_topn' SKIP 1 -
+       CENTER '&_sup_hdr' SKIP 1 -
+       LEFT 'Query No: 2' -
+       RIGHT 'Date: &_run_date' SKIP 1 -
+       RIGHT 'Page: ' SQL.PNO SKIP 2
+
+-- ===== Column formats =====
+COLUMN year        HEADING 'Year'                     FORMAT 9999
+COLUMN quarter     HEADING 'Quarter'                  FORMAT A7
+COLUMN genre       HEADING 'Genre'                    FORMAT A20
+COLUMN spend       HEADING 'Total Purchase(RM)'       FORMAT 999,999,990.99
+COLUMN pct_qoq     HEADING 'Quarter-over-Quarter|%'   FORMAT 999,999,990.99
+COLUMN po_cnt_qtr  HEADING 'Purchased|Ordered'        FORMAT 9,999
+COLUMN aov         HEADING 'Average Order Value (RM)' FORMAT 999,999,990.99
+COLUMN qty_pur     HEADING 'Quantity|Purchased'       FORMAT 999,999,999
+
+BREAK ON year SKIP 1 ON quarter SKIP 1
+COMPUTE SUM LABEL 'Total:' OF spend qty_pur po_cnt_qtr ON year quarter
+
+-- ===== Main query =====
+WITH
+supplier_list AS (
+  SELECT TRIM(REGEXP_SUBSTR(UPPER('&p_suppliers'), '[^,]+', 1, LEVEL)) AS supplier_name
+  FROM dual
+  CONNECT BY LEVEL <= CASE WHEN '&p_suppliers' = '%' THEN 1
+                           ELSE REGEXP_COUNT('&p_suppliers', ',') + 1 END
+),
+
+-- Line-level view (include previous year for QoQ)
+p_lines AS (
+  SELECT
+    d.cal_year        AS year,
+    d.cal_quarter     AS quarter,
+    CASE d.cal_quarter WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END AS qnum,
+    b.genre           AS genre,
+    p.purchaseOrderId AS po_id,
+    p.quantity        AS line_qty,
+    p.totalAmount     AS line_amt
+  FROM FactPurchase p
+  JOIN DimDate      d ON d.dateKey     = p.dateKey
+  JOIN DimBook      b ON b.bookKey     = p.bookKey
+  JOIN DimSuppliers s ON s.supplierKey = p.supplierKey
+  WHERE d.cal_year BETWEEN (&p_year_from - 1) AND &p_year_to
+    AND ( '&p_suppliers' = '%'
+          OR UPPER(s.supplierName) IN (SELECT supplier_name FROM supplier_list) )
+),
+
+-- PO header totals recovered from lines
+po_tot AS (
+  SELECT
+    year, quarter, qnum, po_id,
+    SUM(line_amt) AS po_amt,   
+    SUM(line_qty) AS po_qty    
+  FROM p_lines
+  GROUP BY year, quarter, qnum, po_id
+),
+
+-- Per-PO per-genre totals (no rounding)
+po_genre_share AS (
+  SELECT
+    year, quarter, qnum, po_id, genre,
+    SUM(line_amt) AS g_amt,
+    SUM(line_qty) AS g_qty
+  FROM p_lines
+  GROUP BY year, quarter, qnum, po_id, genre
+),
+
+-- Primary genre per PO = genre with max g_amt (ties -> alphabetic)
+po_primary_genre AS (
+  SELECT year, quarter, qnum, po_id, genre
+  FROM (
+    SELECT
+      s.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY year, quarter, qnum, po_id
+        ORDER BY g_amt DESC, genre ASC
+      ) AS rn
+    FROM po_genre_share s
+  )
+  WHERE rn = 1
+),
+
+-- Aggregate by the primary-genre assignment
+genre_partitioned AS (
+  SELECT
+    pg.year, pg.quarter, pg.qnum, pg.genre,
+    COUNT(DISTINCT pg.po_id) AS po_cnt,      
+    SUM(t.po_amt)            AS spend,       
+    SUM(t.po_qty)            AS qty_pur      
+  FROM po_primary_genre pg
+  JOIN po_tot t
+    ON t.year=pg.year AND t.quarter=pg.quarter AND t.qnum=pg.qnum AND t.po_id=pg.po_id
+  GROUP BY pg.year, pg.quarter, pg.qnum, pg.genre
+),
+
+-- Universe of quarters present in the data window
+qtrs AS (
+  SELECT DISTINCT year, quarter, qnum
+  FROM p_lines
+  WHERE year BETWEEN &p_year_from AND &p_year_to
+),
+
+-- Universe of all genres (use your master list)
+all_genres AS (
+  SELECT DISTINCT genre
+  FROM DimBook
+  WHERE genre IS NOT NULL
+),
+
+-- Cross join: every (quarter x genre), then fill from partitioned results
+qtr_genre_universe AS (
+  SELECT q.year, q.quarter, q.qnum, g.genre
+  FROM qtrs q
+  CROSS JOIN all_genres g
+),
+
+filled AS (
+  SELECT
+    u.year, u.quarter, u.qnum, u.genre,
+    NVL(gp.spend,   0) AS spend,
+    NVL(gp.qty_pur, 0) AS qty_pur,
+    NVL(gp.po_cnt,  0) AS po_cnt
+  FROM qtr_genre_universe u
+  LEFT JOIN genre_partitioned gp
+    ON gp.year=u.year AND gp.quarter=u.quarter AND gp.qnum=u.qnum AND gp.genre=u.genre
+),
+
+-- Rank including zero-rows so we can always show up to &p_topn
+ranked AS (
+  SELECT
+    f.*,
+    ROW_NUMBER() OVER (PARTITION BY year, quarter ORDER BY spend DESC, genre) AS rn
+  FROM filled f
+),
+
+-- Keep top-N (zeros included at the tail if needed). No OTHERS row required.
+keep_rows AS (
+  SELECT year, quarter, qnum, genre, spend, qty_pur, po_cnt
+  FROM ranked
+  WHERE rn <= &p_topn
+),
+
+summary_rows AS (
+  SELECT * FROM keep_rows
+),
+
+trend AS (
+  SELECT
+    r.year, r.quarter, r.qnum, r.genre,
+    r.spend, r.qty_pur,
+    r.po_cnt       AS po_cnt_qtr,
+    CASE WHEN NVL(r.po_cnt,0)=0 THEN NULL ELSE ROUND(r.spend / r.po_cnt, 2) END AS aov,
+    LAG(r.spend) OVER (PARTITION BY r.genre ORDER BY r.year, r.qnum) AS prev_spend
+  FROM summary_rows r
+),
+final AS (
+  SELECT
+    year, quarter, qnum, genre,
+    NVL(spend,0)     AS spend,
+    NVL(qty_pur,0)   AS qty_pur,
+    NVL(po_cnt_qtr,0) AS po_cnt_qtr,
+    NVL(aov,0)       AS aov,
+    NVL(
+      CASE
+        WHEN year = &p_year_from AND qnum = 1 THEN 0
+        WHEN prev_spend IS NULL OR prev_spend = 0 THEN 0
+        ELSE ROUND((spend - prev_spend) / NULLIF(prev_spend,0) * 100, 2)
+      END,
+    0) AS pct_qoq
+  FROM trend
+)
+
+SELECT
+  year, quarter, genre,
+  spend, pct_qoq, po_cnt_qtr, aov, qty_pur
+FROM final
+WHERE year BETWEEN &p_year_from AND &p_year_to
+      AND NOT (spend = 0 AND qty_pur = 0 AND po_cnt_qtr = 0) 
+ORDER BY year, qnum, spend DESC;
+
+TTITLE OFF
+UNDEFINE p_year_from
+UNDEFINE p_year_to
+UNDEFINE p_topn
+UNDEFINE p_suppliers

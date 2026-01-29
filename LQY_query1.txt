@@ -1,0 +1,118 @@
+SET PAGESIZE 35
+SET LINESIZE 130
+SET TRIMSPOOL ON
+SET VERIFY OFF
+SET FEEDBACK OFF
+SET SERVEROUTPUT ON
+
+ACCEPT p_year_from NUMBER PROMPT 'Enter START YEAR (e.g., 2018): '
+ACCEPT p_year_to   NUMBER PROMPT 'Enter END YEAR   (e.g., 2022): '
+ACCEPT p_limit     NUMBER PROMPT 'Show top N genres per year (e.g., 5): '
+ACCEPT p_gender    CHAR   DEFAULT 'ALL' PROMPT 'Filter by member gender (M/F/ALL) [ALL]: '
+
+COLUMN run_date NEW_VALUE _run_date
+SELECT TO_CHAR(SYSDATE, 'DD-MON-YYYY') AS run_date FROM dual;
+
+TTITLE CENTER 'Quarterly Analysis of Highest-Performing Sales Genres' SKIP 1 -
+       CENTER 'Period: &p_year_from-&p_year_to | Gender: &p_gender |Top: &p_limit' SKIP 1 -
+       LEFT  'Query No: 1' -
+       RIGHT 'Date: &_run_date' SKIP 1 -
+       RIGHT 'Page: ' SQL.PNO SKIP 2
+
+COLUMN year          HEADING 'Year'          FORMAT 9999
+COLUMN genre         HEADING 'Genre'         FORMAT A17
+COLUMN q1_amt        HEADING 'Q1'            FORMAT 999,999
+COLUMN q2_amt        HEADING 'Q2'            FORMAT 999,999
+COLUMN q3_amt        HEADING 'Q3'            FORMAT 999,999
+COLUMN q4_amt        HEADING 'Q4'            FORMAT 999,999
+COLUMN pct_q1_q2     HEADING 'Q1->Q2%'       FORMAT 990.0
+COLUMN pct_q2_q3     HEADING 'Q2->Q3%'       FORMAT 990.0
+COLUMN pct_q3_q4     HEADING 'Q3->Q4%'       FORMAT 990.0
+COLUMN tot_qty       HEADING 'Total|Quantity'   FORMAT 999,999
+COLUMN qty_diff_pct  HEADING 'Quantity|Different%'      FORMAT 990.0
+COLUMN tot_amt       HEADING 'Total|Amount'     FORMAT 9,999,999
+COLUMN amt_diff_pct  HEADING 'Amount|Different%'   FORMAT 990.0
+
+BREAK ON year SKIP 1
+COMPUTE SUM LABEL 'Total:' OF q1_amt q2_amt q3_amt q4_amt tot_qty tot_amt ON year
+
+WITH sales_q AS (
+  SELECT
+    d.cal_year       AS year,
+    d.cal_quarter    AS qtr,
+    b.genre          AS genre,
+    SUM(fs.line_total) AS amount,
+    SUM(fs.quantity)   AS qty
+  FROM FactSales   fs
+  JOIN DimDate     d ON d.dateKey   = fs.dateKey
+  JOIN DimBook     b ON b.bookKey   = fs.bookKey
+  JOIN DimMembers  m ON m.memberKey = fs.memberKey   
+  WHERE d.cal_year BETWEEN (&p_year_from - 1) AND &p_year_to
+    AND (UPPER('&p_gender') = 'ALL' OR UPPER(m.memberGender) = UPPER('&p_gender')) 
+  GROUP BY d.cal_year, d.cal_quarter, b.genre
+)
+, genre_year AS (
+  SELECT
+    year, genre,
+    SUM(CASE WHEN qtr='Q1' THEN amount ELSE 0 END) AS q1_amt,
+    SUM(CASE WHEN qtr='Q2' THEN amount ELSE 0 END) AS q2_amt,
+    SUM(CASE WHEN qtr='Q3' THEN amount ELSE 0 END) AS q3_amt,
+    SUM(CASE WHEN qtr='Q4' THEN amount ELSE 0 END) AS q4_amt,
+    SUM(qty) AS tot_qty,
+    SUM(amount) AS tot_amt
+  FROM sales_q
+  GROUP BY year, genre
+)
+, genre_metrics AS (
+  SELECT
+    gy.year,
+    gy.genre,
+    gy.q1_amt, gy.q2_amt, gy.q3_amt, gy.q4_amt,
+    CASE WHEN gy.q1_amt=0 THEN NULL 
+         ELSE ROUND((gy.q2_amt-gy.q1_amt)/NULLIF(gy.q1_amt,0)*100,1) END AS pct_q1_q2,
+    CASE WHEN gy.q2_amt=0 THEN NULL 
+         ELSE ROUND((gy.q3_amt-gy.q2_amt)/NULLIF(gy.q2_amt,0)*100,1) END AS pct_q2_q3,
+    CASE WHEN gy.q3_amt=0 THEN NULL 
+         ELSE ROUND((gy.q4_amt-gy.q3_amt)/NULLIF(gy.q3_amt,0)*100,1) END AS pct_q3_q4,  
+    gy.tot_qty,
+    LAG(gy.tot_qty) OVER (PARTITION BY gy.genre ORDER BY gy.year) AS prev_qty,
+    gy.tot_amt,
+    LAG(gy.tot_amt) OVER (PARTITION BY gy.genre ORDER BY gy.year) AS prev_amt
+  FROM genre_year gy
+)
+, ranked AS (
+  SELECT
+    year, genre,
+    q1_amt, q2_amt, q3_amt, q4_amt,
+    pct_q1_q2, pct_q2_q3, pct_q3_q4,
+    tot_qty,
+    CASE WHEN prev_qty IS NULL OR prev_qty=0 THEN 0
+         ELSE ROUND((tot_qty-prev_qty)/prev_qty*100,1) END AS qty_diff_pct,
+    tot_amt,
+    CASE WHEN prev_amt IS NULL OR prev_amt=0 THEN 0
+         ELSE ROUND((tot_amt-prev_amt)/prev_amt*100,1) END AS amt_diff_pct,
+    ROW_NUMBER() OVER (PARTITION BY year ORDER BY NVL(tot_amt,0) DESC) AS rn
+  FROM genre_metrics
+  WHERE year BETWEEN &p_year_from AND &p_year_to
+)
+SELECT
+  year, genre,
+  NVL(q1_amt,0) AS q1_amt,
+  NVL(q2_amt,0) AS q2_amt,
+  NVL(q3_amt,0) AS q3_amt,
+  NVL(q4_amt,0) AS q4_amt,
+  pct_q1_q2, pct_q2_q3, pct_q3_q4,
+  NVL(tot_qty,0) AS tot_qty,
+  qty_diff_pct,
+  NVL(tot_amt,0) AS tot_amt,
+  amt_diff_pct
+FROM ranked
+WHERE rn <= NVL(&p_limit,5)
+ORDER BY year, tot_amt DESC, genre;
+
+TTITLE OFF
+UNDEFINE p_year_from
+UNDEFINE p_year_to
+UNDEFINE p_limit
+UNDEFINE p_gender
+

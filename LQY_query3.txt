@@ -1,0 +1,141 @@
+SET SQLBLANKLINES ON
+SET PAGESIZE 35
+SET LINESIZE 130
+SET TRIMSPOOL ON
+SET VERIFY OFF
+SET FEEDBACK OFF
+SET SERVEROUTPUT ON
+SET TAB OFF
+ALTER SESSION SET NLS_DATE_FORMAT = 'DD-MON-YYYY';
+
+ACCEPT p_year_from NUMBER PROMPT 'Enter START YEAR (e.g., 2016): '
+ACCEPT p_year_to   NUMBER PROMPT 'Enter END YEAR   (e.g., 2020): '
+ACCEPT p_state     CHAR   DEFAULT '%' PROMPT 'Member State(s) ( % for All; comma-separated ): '
+ACCEPT p_cov       NUMBER DEFAULT '15'  PROMPT 'Target GM% threshold (quarter) [15]: '
+
+COLUMN run_dt NEW_VALUE _run_dt NOPRINT
+SELECT TO_CHAR(SYSDATE, 'DD-MON-YYYY') run_dt FROM dual;
+
+COLUMN state_hdr NEW_VALUE _state_hdr NOPRINT
+SET TERMOUT OFF
+WITH state_list AS (
+  SELECT TRIM(REGEXP_SUBSTR(UPPER('&p_state'), '[^,]+', 1, LEVEL)) AS state_name
+  FROM dual
+  CONNECT BY LEVEL <= CASE WHEN '&p_state'='%' THEN 1 ELSE REGEXP_COUNT('&p_state', ',') + 1 END
+),
+matched AS (
+  SELECT DISTINCT UPPER(NVL(NULLIF(TRIM(state), ''), 'UNKNOWN')) AS state_norm
+  FROM DimMembers
+  WHERE '&p_state'='%' OR UPPER(NVL(NULLIF(TRIM(state), ''), 'UNKNOWN')) IN (SELECT state_name FROM state_list)
+)
+SELECT CASE
+         WHEN '&p_state'='%' THEN 'Member States: All'
+         WHEN COUNT(*) = 0   THEN 'Member States: (none matched)'
+         ELSE 'Member States: ' ||
+              SUBSTR(LISTAGG(state_norm, ', ') WITHIN GROUP (ORDER BY state_norm), 1, 120)
+       END AS state_hdr
+FROM matched;
+SET TERMOUT ON
+
+TTITLE CENTER 'Quarterly Gross Margin by Member State' SKIP 1 -
+       CENTER 'Years: &p_year_from to &p_year_to' SKIP 1 -
+       CENTER '&_state_hdr' SKIP 1 -
+       CENTER 'Target=&p_cov.%' SKIP 1 -
+       LEFT  'Query No: 3' -
+       RIGHT 'Date: &_run_dt  |  Page: ' SQL.PNO SKIP 2
+
+-- ===== Column formats =====
+COLUMN year             HEADING 'Year'                     FORMAT 9999
+COLUMN quarter          HEADING 'Quarter'                  FORMAT A7
+COLUMN state            HEADING 'Member State'             FORMAT A16
+COLUMN total_revenue    HEADING 'Total Revenue(RM)'        FORMAT 999,999,990.99
+COLUMN total_cost       HEADING 'Total Cost(RM)'           FORMAT 999,999,990.99
+COLUMN total_gm         HEADING 'Total Gross Profit(RM)'   FORMAT 999,999,990.99
+COLUMN total_gm_pct     HEADING 'Total Gross|Margin%'      FORMAT 990.00
+COLUMN gm_pct_qoq       HEADING 'GP% QoQ|Change'           FORMAT 990.00
+COLUMN signal           HEADING 'Signal'                   FORMAT A14
+
+-- Grouping + subtotals
+BREAK ON year SKIP 1 ON quarter SKIP 1
+COMPUTE SUM LABEL 'Total:' OF total_revenue total_cost total_gm ON quarter year 
+
+WITH
+-- Calendar scope
+cal AS (
+  SELECT DISTINCT d.cal_year AS year,
+         d.cal_quarter AS quarter,
+         CASE d.cal_quarter WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END AS qnum
+  FROM DimDate d
+  WHERE d.cal_year BETWEEN &p_year_from AND &p_year_to
+),
+-- Input state list (uppercased)
+state_list AS (
+  SELECT TRIM(REGEXP_SUBSTR(UPPER('&p_state'), '[^,]+', 1, LEVEL)) AS state_name
+  FROM dual
+  CONNECT BY LEVEL <= CASE WHEN '&p_state'='%' THEN 1 ELSE REGEXP_COUNT('&p_state', ',') + 1 END
+),
+-- Sales aggregated to Member State × Quarter (UNKNOWN for null/blank state)
+sales_state AS (
+  SELECT
+    c.year,
+    c.quarter,
+    c.qnum,
+    UPPER(NVL(NULLIF(TRIM(m.state), ''), 'UNKNOWN')) AS state,
+    SUM(fs.line_total)                                AS total_revenue,
+    SUM(fs.quantity * (0.8 * NVL(b.price, 0)))        AS total_cost,
+    SUM(fs.line_total) - SUM(fs.quantity * (0.8 * NVL(b.price, 0))) AS total_gm
+  FROM FactSales fs
+  JOIN DimDate    d ON d.dateKey   = fs.dateKey
+  JOIN DimBook    b ON b.bookKey   = fs.bookKey
+  JOIN DimMembers m ON m.memberKey = fs.memberKey
+  JOIN cal        c ON c.year = d.cal_year AND c.quarter = d.cal_quarter
+  WHERE '&p_state'='%' OR UPPER(NVL(NULLIF(TRIM(m.state), ''), 'UNKNOWN')) IN (SELECT state_name FROM state_list)
+  GROUP BY c.year, c.quarter, c.qnum, UPPER(NVL(NULLIF(TRIM(m.state), ''), 'UNKNOWN'))
+),
+-- Compute GM% and QoQ change per state
+final AS (
+  SELECT
+    s.year,
+    s.quarter,
+    s.qnum,
+    s.state,
+    s.total_revenue,
+    s.total_cost,
+    s.total_gm,
+    CASE WHEN s.total_revenue = 0 THEN NULL
+         ELSE ROUND(s.total_gm / s.total_revenue * 100, 2)
+    END AS total_gm_pct
+  FROM sales_state s
+),
+final_with_qoq AS (
+  SELECT
+    f.*,
+    ROUND(
+      f.total_gm_pct
+      - LAG(f.total_gm_pct) OVER (PARTITION BY f.state ORDER BY f.year, f.qnum),
+      2
+    ) AS gm_pct_qoq
+  FROM final f
+)
+SELECT
+  year,
+  quarter,
+  state,
+  total_revenue,
+  total_cost,
+  total_gm,
+  total_gm_pct,
+  NVL(gm_pct_qoq, 0) AS gm_pct_qoq,
+  CASE
+    WHEN NVL(total_gm_pct, 0) >= &p_cov        THEN 'Meets Target'
+    WHEN NVL(total_gm_pct, 0) >= (&p_cov - 3)  THEN 'Near Target'
+    ELSE                                            'Below Target'
+  END AS signal
+FROM final_with_qoq
+ORDER BY year, qnum, state;
+
+TTITLE OFF
+UNDEFINE p_year_from
+UNDEFINE p_year_to
+UNDEFINE p_state
+UNDEFINE p_cov
